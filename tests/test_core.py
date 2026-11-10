@@ -161,3 +161,21 @@ def test_enf_detected_in_grid_hum_and_removed_by_scrub():
     assert not detect_enf(fan + noise, sr).present
     y, _ = scrub(hum + noise, sr, ScrubConfig(seed=0))
     assert not detect_enf(y, sr).present
+
+
+def test_detect_ridges_finds_flyover_not_noise_or_hum():
+    from flyover_scrub.scrub import detect_ridges
+
+    rng = np.random.default_rng(4)
+    trk = make_track(0.0, 260.0, start_xy=(-9000.0, -400.0), altitude=700.0, speed=70.0, heading_deg=5.0)
+    n = SR * 120
+    bg = rng.normal(size=n)
+    plane = synthesize_flyover(trk, np.zeros(3), 70.0, n, SR, f0=90.0, rng=rng)
+    plane *= 10 ** (-10 / 20) * bg.std() / plane[plane != 0].std()
+    ridges = detect_ridges(bg + plane, SR)
+    assert len(ridges) >= 1
+    assert ridges[0].f_start > ridges[0].f_end  # a flyover falls in pitch
+    assert detect_ridges(bg, SR) == []
+    t = np.arange(n) / SR
+    hum = 0.2 * np.sin(2 * np.pi * 60 * t) + 0.1 * np.sin(2 * np.pi * 120 * t)
+    assert detect_ridges(bg + hum, SR) == []

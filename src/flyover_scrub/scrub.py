@@ -158,3 +158,58 @@ def scrub(audio: np.ndarray, sr: int, cfg: ScrubConfig | None = None) -> tuple[n
         ridge_fraction=float((ridge_mask & inband)[inband[:, 0]].mean()),
         ridges_found=n_ridges,
     )
+
+
+@dataclass
+class RidgeInfo:
+    t_start: float
+    t_end: float
+    f_start: float
+    f_end: float
+    strength_db: float
+
+
+def detect_ridges(audio: np.ndarray, sr: int, cfg: ScrubConfig | None = None, *, min_db: float = 8.0,
+                  min_s: float = 20.0, min_glide: float = 0.01, window_s: float = 1.0) -> list[RidgeInfo]:
+    """Long, *gliding* narrowband ridges (aircraft-like), strongest first.
+
+    Unlike the scrub's internal ridge mask (tuned to over-detect, since a false ridge
+    costs nothing there), this is a reporting detector: a ridge must last ``min_s``
+    seconds, stand ``min_db`` above the local floor, and change frequency by at least
+    ``min_glide`` (fractional) end to end, so steady hum and machinery don't count.
+    Lines below the floor are not found here, though a matched filter can still
+    recover them: absence of ridges is not proof of absence.
+    """
+    cfg = cfg or ScrubConfig()
+    x = np.asarray(audio, dtype=np.float64)
+    if x.ndim == 2:
+        x = x.mean(axis=1)
+    nper = int(round(window_s * sr))
+    nper += nper % 2
+    hop = max(1, nper // 4)
+    f, t, Z = stft(x, fs=sr, nperseg=nper, noverlap=nper - hop, window="hann")
+    df, dt = f[1] - f[0], hop / sr
+    mag = np.abs(Z)
+    ratio_db = 20 * np.log10((mag + 1e-12) / (_floor(mag, df, dt, cfg) + 1e-12))
+    inband = ((f >= cfg.band[0]) & (f <= cfg.band[1]))[:, None]
+    r = np.where(inband, ratio_db, -99)
+    peak = (r > min_db) & (r >= ndimage.maximum_filter1d(r, 3, axis=0))
+    max_bins = max(1, int(np.ceil(5.0 * dt / df)))  # aircraft glide < ~5 Hz/s
+    bridged = peak | ndimage.binary_closing(peak, np.ones((1, 5), bool))
+    bridged = ndimage.binary_dilation(bridged, np.ones((2 * max_bins + 1, 1), bool))  # allow glide between frames
+    lab, n = ndimage.label(bridged, structure=np.ones((3, 3), bool))
+    out = []
+    for i, sl in enumerate(ndimage.find_objects(lab), start=1):
+        if sl is None or (sl[1].stop - sl[1].start) * dt < min_s:
+            continue
+        comp = (lab == i) & peak
+        cols = np.where(comp.any(axis=0))[0]
+        if len(cols) * dt < 0.6 * min_s:
+            continue
+        fr = np.array([np.average(f[comp[:, c]], weights=mag[comp[:, c], c]) for c in cols])
+        k = max(3, len(cols) // 10)
+        f0, f1 = float(np.median(fr[:k])), float(np.median(fr[-k:]))
+        if abs(f1 - f0) < min_glide * (f0 + f1) / 2:
+            continue
+        out.append(RidgeInfo(float(t[cols[0]]), float(t[cols[-1]]), f0, f1, float(np.median(r[comp]))))
+    return sorted(out, key=lambda z: -z.strength_db)
